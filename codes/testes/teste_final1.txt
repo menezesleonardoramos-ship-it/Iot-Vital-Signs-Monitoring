@@ -42,13 +42,16 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
+bool firebaseOnline = false;
+
 unsigned long lastFirebaseSend = 0;
-const unsigned long FIREBASE_INTERVAL = 10000;
+const unsigned long FIREBASE_INTERVAL = 30000;
 
 // =============================================================
 
 void setup() {
   Serial.begin(115200);
+
   Wire.begin(21, 22);
   Wire.setClock(100000);
 
@@ -65,8 +68,10 @@ void setup() {
   particleSensor.setPulseAmplitudeRed(0x0F);
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
   config.database_url = DATABASE_URL;
   config.signer.tokens.legacy_token = DATABASE_SECRET;
+
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 
@@ -127,18 +132,51 @@ void loop() {
   static unsigned long lastTemp = 0;
   if (millis() - lastTemp > 2000) {
     float t = readMAX30205();
-    if (!isnan(t)) temperatura = t;
+    if (!isnan(t)) {
+      temperatura = temperatura * 0.8 + t * 0.2;
+    }
     lastTemp = millis();
   }
 
+  // ================= DISPLAY =================
   updateDisplay(irValue);
 
+  // ================= FIREBASE =================
   if (millis() - lastFirebaseSend > FIREBASE_INTERVAL) {
     sendToFirebase();
     lastFirebaseSend = millis();
   }
+}
 
-  delay(10);
+// =============================================================
+// DISPLAY
+void updateDisplay(long ir) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr);
+
+  u8g2.setCursor(0, 10);
+  u8g2.print("Sinais vitais");
+
+  u8g2.setCursor(90, 10);
+  u8g2.print(firebaseOnline ? "Online" : "Offline");
+
+  u8g2.drawLine(0, 14, 127, 14);
+
+  u8g2.setCursor(0, 28);
+  u8g2.print("BPM: ");
+  bpmAvg > 0 ? u8g2.print(bpmAvg) : u8g2.print("--");
+
+  u8g2.setCursor(0, 40);
+  u8g2.print("SpO2: ");
+  spo2 > 0 ? u8g2.print(spo2) : u8g2.print("--");
+  u8g2.print(" %");
+
+  u8g2.setCursor(0, 52);
+  u8g2.print("Temp: ");
+  u8g2.print(temperatura, 1);
+  u8g2.print(" C");
+
+  u8g2.sendBuffer();
 }
 
 // =============================================================
@@ -152,6 +190,7 @@ float readMAX30205() {
     Wire.beginTransmission(MAX30205_ADDRESS);
     Wire.write(0x00);
     if (Wire.endTransmission(false) != 0) continue;
+
     if (Wire.requestFrom(MAX30205_ADDRESS, 2) != 2) continue;
 
     int16_t raw = (Wire.read() << 8) | Wire.read();
@@ -165,39 +204,11 @@ float readMAX30205() {
   }
 
   if (valid == 0) return NAN;
-
-  float media = soma / valid;
-  return temperatura * 0.8 + media * 0.2;
+  return soma / valid;
 }
 
 // =============================================================
-
-void updateDisplay(long ir) {
-  u8g2.clearBuffer();
-
-  u8g2.setCursor(0, 12);
-  u8g2.print("Temp: ");
-  u8g2.print(temperatura, 1);
-  u8g2.print(" C");
-
-  u8g2.setCursor(0, 24);
-  u8g2.print("BPM: ");
-  bpmAvg > 0 ? u8g2.print(bpmAvg) : u8g2.print("--");
-
-  u8g2.setCursor(0, 36);
-  u8g2.print("SpO2: ");
-  spo2 > 0 ? u8g2.print(spo2) : u8g2.print("--");
-  u8g2.print(" %");
-
-  u8g2.setCursor(0, 48);
-  u8g2.print("IR: ");
-  u8g2.print(ir);
-
-  u8g2.sendBuffer();
-}
-
-// =============================================================
-
+// FIREBASE
 String getDateTimeKey() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return "sem_tempo";
@@ -207,24 +218,28 @@ String getDateTimeKey() {
   return String(buffer);
 }
 
-// =============================================================
-
 void sendToFirebase() {
-  if (!Firebase.ready()) return;
+  if (!Firebase.ready()) {
+    firebaseOnline = false;
+    return;
+  }
 
-  Firebase.RTDB.setFloat(&fbdo, "/atuais/temp", temperatura);
-  Firebase.RTDB.setInt(&fbdo, "/atuais/bpm", bpmAvg);
-  Firebase.RTDB.setInt(&fbdo, "/atuais/spo2", spo2);
+  bool ok = true;
+
+  ok &= Firebase.RTDB.setFloat(&fbdo, "/atuais/temp", temperatura);
+  ok &= Firebase.RTDB.setInt(&fbdo, "/atuais/bpm", bpmAvg);
+  ok &= Firebase.RTDB.setInt(&fbdo, "/atuais/spo2", spo2);
 
   String basePath = "/historico/" + getDateTimeKey();
+  ok &= Firebase.RTDB.setFloat(&fbdo, basePath + "/temp", temperatura);
+  ok &= Firebase.RTDB.setInt(&fbdo, basePath + "/bpm", bpmAvg);
+  ok &= Firebase.RTDB.setInt(&fbdo, basePath + "/spo2", spo2);
 
-  Firebase.RTDB.setFloat(&fbdo, basePath + "/temp", temperatura);
-  Firebase.RTDB.setInt(&fbdo, basePath + "/bpm", bpmAvg);
-  Firebase.RTDB.setInt(&fbdo, basePath + "/spo2", spo2);
+  firebaseOnline = ok;
 }
 
 // =============================================================
-
+// MENSAGEM OLED
 void displayMessage(const char* l1, const char* l2, const char* l3) {
   u8g2.clearBuffer();
   u8g2.drawStr(10, 20, l1);
