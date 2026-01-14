@@ -1,0 +1,488 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include "heartRate.h"
+#include "time.h"
+
+// ================= WIFI CONFIG =================
+#define WIFI_SSID "PET Convidados"
+#define WIFI_PASSWORD "petagregado"
+
+// ================= FIREBASE CONFIG =================
+#define DATABASE_URL "https://projeto-integradora-ii-default-rtdb.firebaseio.com"
+#define DATABASE_SECRET "uC0SyV22Gi3CEPqkslCwpJtPB1Kr2EAiH9JmrMVD"
+
+// ================= HARDWARE CONFIG =================
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define MAX30205_ADDR 0x48
+
+// ================= DISPLAY CONFIG =================
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ================= MAX30102 VARIABLES =================
+MAX30105 particleSensor;
+const int SAMPLE_BUFFER_SIZE = 50;  // REDUZIDO para performance
+uint32_t irBuffer[SAMPLE_BUFFER_SIZE];
+uint32_t redBuffer[SAMPLE_BUFFER_SIZE];
+int bufferLength = SAMPLE_BUFFER_SIZE;
+
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+int32_t heartRate = 0;
+int8_t validHeartRate = 0;
+
+// ================= TIMING VARIABLES =================
+unsigned long lastSensorUpdate = 0;
+unsigned long lastFirebaseUpdate = 0;
+unsigned long lastFirebaseSuccess = 0;
+const int SENSOR_UPDATE_INTERVAL = 500;    // 0.5 segundo para sensores (mais rápido)
+const int FIREBASE_UPDATE_INTERVAL = 1000; // 1 segundo para Firebase
+
+// ================= FIREBASE OBJECTS =================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+bool timeSynced = false;
+bool firebaseConnected = false;
+int firebaseErrorCount = 0;
+const int MAX_FIREBASE_ERRORS = 5;
+
+// ================= DATA BUFFERS =================
+struct SensorData {
+  float temperature;
+  int bpm;
+  int spo2Value;
+  unsigned long timestamp;
+};
+
+SensorData currentData;
+SensorData lastSentData;
+
+// ================= FUNCTION PROTOTYPES =================
+float readMAX30205();
+void updateMAX30102();
+void drawDisplay(float temperatura, int bpm, int spo2Value);
+void sendToFirebase(float temperatura, int bpm, int spo2Value);
+void connectToWiFi();
+void initFirebase();
+void syncTime();
+void handleFirebaseError();
+bool shouldSendToFirebase();
+
+// ================= SENSOR FUNCTIONS =================
+float readMAX30205() {
+  Wire.beginTransmission(MAX30205_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission(false) != 0) return NAN;
+
+  if (Wire.requestFrom(MAX30205_ADDR, 2) != 2) return NAN;
+
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+  
+  return (float)((int16_t)((msb << 8) | lsb)) / 256.0;
+}
+
+void updateMAX30102() {
+  // Otimizado: remove menos amostras para atualização mais rápida
+  const int SAMPLES_TO_REMOVE = SAMPLE_BUFFER_SIZE / 8; // 12.5%
+  
+  // Desloca buffer
+  for (int i = SAMPLES_TO_REMOVE; i < SAMPLE_BUFFER_SIZE; i++) {
+    redBuffer[i - SAMPLES_TO_REMOVE] = redBuffer[i];
+    irBuffer[i - SAMPLES_TO_REMOVE] = irBuffer[i];
+  }
+  
+  // Coleta novas amostras
+  for (int i = SAMPLE_BUFFER_SIZE - SAMPLES_TO_REMOVE; i < SAMPLE_BUFFER_SIZE; i++) {
+    if (particleSensor.available()) {
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample();
+    } else {
+      particleSensor.check();
+    }
+  }
+  
+  // Recalcula (com timeout para não travar)
+  unsigned long startCalc = millis();
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, 
+                                         &spo2, &validSPO2, &heartRate, &validHeartRate);
+  
+  // Limita tempo máximo de cálculo
+  if (millis() - startCalc > 100) {
+    validSPO2 = 0;
+    validHeartRate = 0;
+  }
+}
+
+// ================= DISPLAY FUNCTION =================
+void drawDisplay(float temperatura, int bpm, int spo2Value) {
+  u8g2.clearBuffer();
+  
+  // Título - SINAIS VITAIS
+  u8g2.setFont(u8g2_font_9x15B_tr);
+  const char* titulo = "SINAIS VITAIS";
+  u8g2.drawStr(20, 15, titulo);
+  
+  // Status Firebase
+  u8g2.setFont(u8g2_font_5x7_tr);
+  if (firebaseConnected) {
+    u8g2.drawStr(100, 10, "ONLINE");
+  } else {
+    u8g2.drawStr(100, 10, "OFFLINE");
+  }
+  
+  // Linha divisória
+  u8g2.drawHLine(0, 18, 128);
+  
+  // BPM
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(15, 32, "BPM:");
+  
+  u8g2.setFont(u8g2_font_8x13B_tn);
+  char bpmStr[5];
+  if (validHeartRate == 1 && heartRate > 0) {
+    sprintf(bpmStr, "%d", heartRate);
+  } else {
+    strcpy(bpmStr, "--");
+  }
+  u8g2.drawStr(60, 32, bpmStr);
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(85, 32, "bpm");
+  
+  // SpO2
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(15, 47, "SpO2:");
+  
+  u8g2.setFont(u8g2_font_8x13B_tn);
+  char spo2Str[5];
+  if (validSPO2 == 1 && spo2 >= 0 && spo2 <= 100) {
+    sprintf(spo2Str, "%d", spo2);
+  } else {
+    strcpy(spo2Str, "--");
+  }
+  u8g2.drawStr(60, 47, spo2Str);
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(85, 47, "%");
+  
+  // TEMP
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(15, 62, "TEMP:");
+  
+  u8g2.setFont(u8g2_font_8x13B_tn);
+  char tempStr[7];
+  if (!isnan(temperatura)) {
+    dtostrf(temperatura, 4, 1, tempStr);
+  } else {
+    strcpy(tempStr, "--");
+  }
+  u8g2.drawStr(60, 62, tempStr);
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawUTF8(85, 62, "°C");
+  
+  u8g2.sendBuffer();
+}
+
+// ================= FIREBASE FUNCTIONS =================
+void sendToFirebase(float temperatura, int bpm, int spo2Value) {
+  if (!firebaseConnected) {
+    return;
+  }
+
+  // Otimização: usa operações batch
+  FirebaseJson json;
+  
+  // Dados atuais
+  if (Firebase.RTDB.setFloat(&fbdo, "/Sensores-atuais/freq_cardiaca", (float)bpm)) {
+    // Sucesso
+  } else {
+    handleFirebaseError();
+  }
+  
+  if (Firebase.RTDB.setFloat(&fbdo, "/Sensores-atuais/oximetria", (float)spo2Value)) {
+    // Sucesso
+  } else {
+    handleFirebaseError();
+  }
+  
+  if (Firebase.RTDB.setFloat(&fbdo, "/Sensores-atuais/temperatura", temperatura)) {
+    // Sucesso
+  } else {
+    handleFirebaseError();
+  }
+
+  // Envia histórico apenas a cada 10 segundos para reduzir carga
+  static unsigned long lastHistorySend = 0;
+  if (millis() - lastHistorySend > 10000) {
+    time_t now = time(nullptr);
+    if (now > 24 * 3600) {
+      struct tm* timeinfo = localtime(&now);
+      
+      char dataHora[30];
+      sprintf(dataHora, "%04d-%02d-%02d_%02d-%02d-%02d",
+              timeinfo->tm_year + 1900,
+              timeinfo->tm_mon + 1,
+              timeinfo->tm_mday,
+              timeinfo->tm_hour,
+              timeinfo->tm_min,
+              timeinfo->tm_sec);
+
+      String pathHistorico = "/Sensores-historico/" + String(dataHora);
+      
+      FirebaseJson historyJson;
+      historyJson.set("freq_cardiaca", bpm);
+      historyJson.set("oximetria", spo2Value);
+      historyJson.set("temperatura", temperatura);
+      historyJson.set("timestamp", dataHora);
+
+      if (Firebase.RTDB.setJSON(&fbdo, pathHistorico.c_str(), &historyJson)) {
+        lastHistorySend = millis();
+      } else {
+        handleFirebaseError();
+      }
+    }
+  }
+  
+  lastFirebaseSuccess = millis();
+}
+
+void handleFirebaseError() {
+  firebaseErrorCount++;
+  Serial.print("Erro Firebase: ");
+  Serial.println(fbdo.errorReason().c_str());
+  
+  if (firebaseErrorCount >= MAX_FIREBASE_ERRORS) {
+    firebaseConnected = false;
+    Serial.println("Firebase desconectado. Tentando reconectar...");
+    initFirebase();
+  }
+}
+
+bool shouldSendToFirebase() {
+  // Verifica se os dados mudaram significativamente
+  bool dataChanged = 
+    (abs(currentData.temperature - lastSentData.temperature) > 0.1) ||
+    (abs(currentData.bpm - lastSentData.bpm) > 2) ||
+    (abs(currentData.spo2Value - lastSentData.spo2Value) > 1);
+  
+  // Força envio se passou muito tempo (10 segundos)
+  bool forceSend = (millis() - lastFirebaseSuccess > 10000);
+  
+  return dataChanged || forceSend;
+}
+
+// ================= NETWORK FUNCTIONS =================
+void connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+  
+  Serial.print("Conectando ao WiFi: ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+    delay(250);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi conectado!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFalha ao conectar WiFi!");
+  }
+}
+
+void initFirebase() {
+  if (!firebaseConnected) {
+    config.database_url = DATABASE_URL;
+    config.signer.tokens.legacy_token = DATABASE_SECRET;
+    
+    // Timeouts mais curtos para resposta mais rápida
+    config.timeout.serverResponse = 3000;  // 3 segundos
+    config.timeout.sslHandshake = 5000;    // 5 segundos
+    
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+    
+    Serial.print("Conectando ao Firebase...");
+    
+    int timeout = 0;
+    while (!Firebase.ready() && timeout < 10) {
+      delay(200);
+      Serial.print(".");
+      timeout++;
+    }
+    
+    if (Firebase.ready()) {
+      firebaseConnected = true;
+      firebaseErrorCount = 0;
+      Serial.println("\nFirebase conectado!");
+    } else {
+      firebaseConnected = false;
+      Serial.println("\nFalha ao conectar Firebase!");
+    }
+  }
+}
+
+void syncTime() {
+  if (!timeSynced) {
+    configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    
+    Serial.print("Sincronizando horário");
+    unsigned long start = millis();
+    
+    while (time(nullptr) < 24 * 3600) {
+      if (millis() - start > 10000) {
+        Serial.println("\nTimeout na sincronização NTP!");
+        break;
+      }
+      Serial.print(".");
+      delay(500);
+    }
+    
+    time_t now = time(nullptr);
+    if (now > 24 * 3600) {
+      timeSynced = true;
+      Serial.println("\nHorário sincronizado!");
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  
+  // Inicializa I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  
+  // Inicializa display
+  u8g2.begin();
+  
+  // Tela inicial
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_9x15B_tr);
+  u8g2.drawStr(25, 30, "INICIANDO");
+  u8g2.drawStr(20, 45, "SINAIS VITAIS");
+  u8g2.sendBuffer();
+  
+  // Conecta WiFi
+  connectToWiFi();
+  
+  // Inicializa Firebase se WiFi conectado
+  if (WiFi.status() == WL_CONNECTED) {
+    initFirebase();
+    syncTime();
+  }
+  
+  // Inicializa MAX30102
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 não encontrado!");
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_7x13B_tr);
+    u8g2.drawStr(15, 30, "ERRO MAX30102");
+    u8g2.sendBuffer();
+    delay(2000);
+  } else {
+    // Configura MAX30102
+    particleSensor.setup(30, 1, 2, 100, 69, 4096); // Brilho reduzido para performance
+    particleSensor.enableDIETEMPRDY();
+    
+    // Coleta inicial mais rápida
+    for (int i = 0; i < SAMPLE_BUFFER_SIZE; i++) {
+      if (particleSensor.available()) {
+        redBuffer[i] = particleSensor.getRed();
+        irBuffer[i] = particleSensor.getIR();
+        particleSensor.nextSample();
+      }
+    }
+    
+    // Primeiro cálculo
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, 
+                                           &spo2, &validSPO2, &heartRate, &validHeartRate);
+  }
+  
+  Serial.println("Sistema pronto!");
+  delay(500);
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Atualiza sensores mais frequentemente
+  if (currentTime - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
+    // Atualiza MAX30102
+    updateMAX30102();
+    
+    // Lê temperatura
+    float temperatura = readMAX30205();
+    
+    // Armazena dados atuais
+    currentData.temperature = isnan(temperatura) ? 0 : temperatura;
+    currentData.bpm = (validHeartRate == 1 && heartRate > 0) ? heartRate : 0;
+    currentData.spo2Value = (validSPO2 == 1 && spo2 >= 0 && spo2 <= 100) ? spo2 : 0;
+    currentData.timestamp = currentTime;
+    
+    // Exibe no Serial Monitor (apenas para debug)
+    static unsigned long lastSerialPrint = 0;
+    if (currentTime - lastSerialPrint >= 2000) {
+      Serial.print("Temp: ");
+      Serial.print(currentData.temperature, 1);
+      Serial.print("°C | BPM: ");
+      Serial.print(currentData.bpm);
+      Serial.print(" | SpO2: ");
+      Serial.print(currentData.spo2Value);
+      Serial.println("%");
+      lastSerialPrint = currentTime;
+    }
+    
+    // Atualiza display
+    drawDisplay(currentData.temperature, currentData.bpm, currentData.spo2Value);
+    
+    lastSensorUpdate = currentTime;
+  }
+  
+  // Verifica conexão WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    firebaseConnected = false;
+    connectToWiFi();
+    
+    if (WiFi.status() == WL_CONNECTED && !timeSynced) {
+      syncTime();
+    }
+  }
+  
+  // Gerencia Firebase
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!firebaseConnected) {
+      initFirebase();
+    }
+    
+    // Envia para Firebase se conectado e dados mudaram
+    if (firebaseConnected && shouldSendToFirebase()) {
+      if (currentTime - lastFirebaseUpdate >= FIREBASE_UPDATE_INTERVAL) {
+        sendToFirebase(currentData.temperature, currentData.bpm, currentData.spo2Value);
+        lastSentData = currentData;
+        lastFirebaseUpdate = currentTime;
+      }
+    }
+  }
+  
+  // Pequena pausa não-bloqueante
+  delay(1);
+}
