@@ -1,0 +1,217 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <time.h>
+
+/* ================= OLED ================= */
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+/* ================= MAX30102 ================= */
+MAX30105 particleSensor;
+
+const byte RATE_SIZE = 8;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+int beatAvg = 0;
+float beatsPerMinute = 0;
+
+long irValue = 0;
+long redValue = 0;
+int spo2 = 0;
+
+/* ================= MAX30205 ================= */
+#define MAX30205_ADDRESS 0x48
+float temperatura = 36.5;
+
+/* ================= WIFI & FIREBASE ================= */
+#define WIFI_SSID "Emerson"
+#define WIFI_PASSWORD "guebas123"
+#define DATABASE_URL "projeto-integradora-ii-default-rtdb.firebaseio.com"
+#define DATABASE_SECRET "uC0SyV22Gi3CEPqkslCwpJtPB1Kr2EAiH9JmrMVD"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastFirebaseSend = 0;
+const unsigned long FIREBASE_INTERVAL = 10000;
+
+/* ================= NTP ================= */
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+const long gmtOffset_sec = -3 * 3600;
+const int daylightOffset_sec = 0;
+
+/* ================= PROTÓTIPOS ================= */
+void initOLED();
+void initMAX30102();
+float readMAX30205();
+int calculateSpO2(long red, long ir);
+void updateDisplay();
+void sendToFirebase();
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+
+  initOLED();
+  initMAX30102();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  config.database_url = DATABASE_URL;
+  config.signer.tokens.legacy_token = DATABASE_SECRET;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+}
+
+/* ================= LOOP ================= */
+void loop() {
+
+  irValue = particleSensor.getIR();
+  redValue = particleSensor.getRed();
+
+  /* ---------- BPM ---------- */
+  if (irValue > 50000) {
+    if (checkForBeat(irValue)) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+
+      beatsPerMinute = 60.0 / (delta / 1000.0);
+
+      if (beatsPerMinute >= 40 && beatsPerMinute <= 180) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+
+        beatAvg = 0;
+        for (byte i = 0; i < RATE_SIZE; i++) beatAvg += rates[i];
+        beatAvg /= RATE_SIZE;
+      }
+    }
+  } else {
+    beatAvg = 0;
+    spo2 = 0;
+  }
+
+  /* ---------- SpO2 ---------- */
+  spo2 = calculateSpO2(redValue, irValue);
+
+  /* ---------- Temperatura ---------- */
+  static unsigned long lastTempRead = 0;
+  if (millis() - lastTempRead > 2000) {
+    temperatura = readMAX30205();
+    lastTempRead = millis();
+  }
+
+  updateDisplay();
+
+  if (millis() - lastFirebaseSend > FIREBASE_INTERVAL) {
+    sendToFirebase();
+    lastFirebaseSend = millis();
+  }
+
+  delay(1);
+}
+
+/* ================= FUNÇÕES ================= */
+
+void initOLED() {
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.clearBuffer();
+  u8g2.drawStr(15, 30, "Sinais Vitais");
+  u8g2.sendBuffer();
+  delay(1000);
+}
+
+void initMAX30102() {
+  particleSensor.begin(Wire, I2C_SPEED_FAST);
+  particleSensor.setup(
+    60,    // brilho LED
+    4,     // média
+    2,     // RED + IR
+    100,   // taxa amostragem
+    411,   // largura pulso
+    4096   // ADC range
+  );
+  particleSensor.setPulseAmplitudeGreen(0);
+}
+
+/* ---------- Temperatura com Oversampling ---------- */
+float readMAX30205() {
+  const int samples = 8;
+  float soma = 0;
+  int valid = 0;
+
+  for (int i = 0; i < samples; i++) {
+    Wire.beginTransmission(MAX30205_ADDRESS);
+    Wire.write(0x00);
+    if (Wire.endTransmission(false) != 0) continue;
+    if (Wire.requestFrom(MAX30205_ADDRESS, 2) != 2) continue;
+
+    int16_t raw = (Wire.read() << 8) | Wire.read();
+    float temp = raw * 0.00390625;
+
+    if (temp >= 30.0 && temp <= 45.0) {
+      soma += temp;
+      valid++;
+    }
+    delay(5);
+  }
+
+  if (valid == 0) return temperatura;
+
+  float media = soma / valid;
+  temperatura = temperatura * 0.8 + media * 0.2;
+  return temperatura;
+}
+
+/* ---------- SpO2 Simplificado ---------- */
+int calculateSpO2(long red, long ir) {
+  if (red < 50000 || ir < 50000) return 0;
+
+  float ratio = (float)red / (float)ir;
+  int spo2Calc = 110 - 25 * ratio;
+
+  return constrain(spo2Calc, 90, 100);
+}
+
+/* ---------- Display ---------- */
+void updateDisplay() {
+  u8g2.clearBuffer();
+  u8g2.setCursor(0, 12);
+  u8g2.print("Temp: ");
+  u8g2.print(temperatura, 1);
+  u8g2.print(" C");
+
+  u8g2.setCursor(0, 24);
+  u8g2.print("BPM: ");
+  beatAvg > 0 ? u8g2.print(beatAvg) : u8g2.print("--");
+
+  u8g2.setCursor(0, 36);
+  u8g2.print("SpO2: ");
+  spo2 > 0 ? u8g2.print(spo2) : u8g2.print("--");
+  u8g2.print(" %");
+
+  u8g2.setCursor(0, 48);
+  u8g2.print("IR: ");
+  u8g2.print(irValue);
+
+  u8g2.sendBuffer();
+}
+
+/* ---------- Firebase ---------- */
+void sendToFirebase() {
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+
+  Firebase.RTDB.setFloat(&fbdo, "/atuais/temp", temperatura);
+  Firebase.RTDB.setInt(&fbdo, "/atuais/bpm", beatAvg);
+  Firebase.RTDB.setInt(&fbdo, "/atuais/spo2", spo2);
+}
