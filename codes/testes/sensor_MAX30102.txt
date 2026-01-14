@@ -1,0 +1,142 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ================= OLED =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================= MAX30205 =================
+#define MAX30205_ADDR 0x48
+#define TEMP_REG 0x00
+
+// ================= FILTRAGEM =================
+#define OVERSAMPLE_COUNT 16
+#define MOVING_AVG_SIZE 20
+
+double emaAlpha = 0.15;
+double emaValue = 0.0;
+
+double movingAvgBuffer[MOVING_AVG_SIZE];
+int movingAvgIndex = 0;
+bool bufferFilled = false;
+
+// ================= FUNÇÕES =================
+
+// Leitura direta do MAX30205
+double readRawTemperature() {
+  Wire.beginTransmission(MAX30205_ADDR);
+  Wire.write(TEMP_REG);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MAX30205_ADDR, 2);
+  if (Wire.available() < 2) return NAN;
+
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+
+  int16_t raw = (msb << 8) | lsb;
+  raw >>= 2; // 14 bits válidos
+
+  return raw * 0.00390625; // °C
+}
+
+// Oversampling
+double readOversampledTemp() {
+  double sum = 0.0;
+  for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
+    sum += readRawTemperature();
+    delay(5);
+  }
+  return sum / OVERSAMPLE_COUNT;
+}
+
+// EMA (IIR)
+double applyEMA(double input) {
+  emaValue = emaAlpha * input + (1.0 - emaAlpha) * emaValue;
+  return emaValue;
+}
+
+// Média móvel
+double applyMovingAverage(double input) {
+  movingAvgBuffer[movingAvgIndex++] = input;
+
+  if (movingAvgIndex >= MOVING_AVG_SIZE) {
+    movingAvgIndex = 0;
+    bufferFilled = true;
+  }
+
+  int count = bufferFilled ? MOVING_AVG_SIZE : movingAvgIndex;
+  double sum = 0.0;
+
+  for (int i = 0; i < count; i++) {
+    sum += movingAvgBuffer[i];
+  }
+
+  return sum / count;
+}
+
+// Rejeição de picos
+bool isValidReading(double value, double lastValue) {
+  return fabs(value - lastValue) < 0.5;
+}
+
+// ================= SETUP =================
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("Erro OLED");
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  // Inicializa filtro
+  emaValue = readOversampledTemp();
+}
+
+// ================= LOOP =================
+void loop() {
+  static double lastValidTemp = emaValue;
+
+  double rawTemp = readOversampledTemp();
+  double filteredTemp = applyEMA(rawTemp);
+
+  if (!isValidReading(filteredTemp, lastValidTemp)) {
+    filteredTemp = lastValidTemp;
+  }
+
+  lastValidTemp = filteredTemp;
+
+  double finalTemp = applyMovingAverage(filteredTemp);
+
+  // ================= OLED =================
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Sinais Vitais");
+  display.println("-------------");
+
+  display.setTextSize(2);
+  display.setCursor(0, 24);
+  display.print("Temp:");
+
+  display.setCursor(0, 46);
+  display.print(finalTemp, 2);
+  display.print(" C");
+
+  display.display();
+
+  delay(500);
+}
+
