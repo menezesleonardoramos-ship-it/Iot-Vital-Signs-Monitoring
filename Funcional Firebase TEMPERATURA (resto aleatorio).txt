@@ -1,0 +1,237 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "time.h"
+
+
+
+#define WIFI_SSID "brisa-3121250"
+#define WIFI_PASSWORD "jqmjgvbk"
+
+
+#define DATABASE_URL "projeto-integradora-ii-default-rtdb.firebaseio.com"
+#define DATABASE_SECRET "uC0SyV22Gi3CEPqkslCwpJtPB1Kr2EAiH9JmrMVD"  
+
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define MAX30205_ADDR 0x48
+
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+
+bool timeSynced = false;
+unsigned long dataMillis = 0;
+
+// ---------- Funções para MAX30205 ----------
+float readMAX30205() {
+  // Lê o registrador 0x00 (2 bytes) e converte para °C
+  Wire.beginTransmission(MAX30205_ADDR);
+  Wire.write(0x00); // pointer para registrador de temperatura
+  if (Wire.endTransmission(false) != 0) return NAN; // erro I2C
+
+  Wire.requestFrom(MAX30205_ADDR, (uint8_t)2);
+  if (Wire.available() < 2) return NAN;
+
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+  uint16_t raw = ((uint16_t)msb << 8) | lsb;
+
+  // Interpreta como signed 16-bit (two's complement) e converte /256
+  int16_t signedRaw = (raw & 0x8000) ? (int16_t)(raw - 65536) : (int16_t)raw;
+  float temp = ((float)signedRaw) / 256.0f;
+  return temp;
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println("Iniciando dispositivo ESP32...");
+
+ 
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(50);
+
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Conectando ao WiFi");
+  int wifiTimeout = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 30) {
+    delay(500);
+    Serial.print(".");
+    wifiTimeout++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nFalha ao conectar WiFi! Reiniciando...");
+    delay(2000);
+    ESP.restart();
+  }
+
+  Serial.println("\nWiFi conectado!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+
+  config.database_url = DATABASE_URL;
+  config.signer.tokens.legacy_token = DATABASE_SECRET;
+
+  
+  config.timeout.serverResponse = 10 * 1000;  
+  config.timeout.sslHandshake = 30 * 1000;    
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.print("Conectando ao Firebase...");
+  int fbTimeout = 0;
+  while (!Firebase.ready() && fbTimeout < 20) {
+    Serial.print(".");
+    delay(500);
+    fbTimeout++;
+  }
+
+  if (Firebase.ready()) {
+    Serial.println("\nFirebase conectado com sucesso!");
+  } else {
+    Serial.println("\nFalha ao conectar Firebase!");
+    Serial.println("Verifique suas credenciais e conexão WiFi.");
+  }
+
+ 
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Sincronizando horário");
+  unsigned long ntpStart = millis();
+  while (time(nullptr) < 24 * 3600) {
+    if (millis() - ntpStart > 30000) {  
+      Serial.println("\nTimeout na sincronização NTP!");
+      break;
+    }
+    Serial.print(".");
+    delay(1000);
+  }
+
+  time_t now = time(nullptr);
+  if (now > 24 * 3600) {
+    timeSynced = true;
+    Serial.println("\nHorário sincronizado!");
+  } else {
+    Serial.println("\nUsando horário padrão.");
+  }
+
+
+  delay(200);
+}
+
+void loop() {
+
+  if (!timeSynced) {
+    time_t now = time(nullptr);
+    if (now > 24 * 3600) {
+      timeSynced = true;
+      Serial.println("Horário sincronizado!");
+    } else {
+      delay(1000);
+      return;
+    }
+  }
+
+
+  if (millis() - dataMillis > 5000 || dataMillis == 0) {
+    dataMillis = millis();
+
+ 
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+
+   
+    char dataHora[30];
+    sprintf(dataHora, "%04d-%02d-%02d_%02d-%02d-%02d",
+            timeinfo->tm_year + 1900,
+            timeinfo->tm_mon + 1,
+            timeinfo->tm_mday,
+            timeinfo->tm_hour,
+            timeinfo->tm_min,
+            timeinfo->tm_sec);
+
+
+    float temperatura = readMAX30205();
+    if (isnan(temperatura)) {
+      Serial.println("Erro lendo MAX30205! Definindo temperatura para 0.0");
+      temperatura = 0.0f;
+    }
+
+
+    randomSeed(micros() ^ ESP.getCycleCount());
+    int oximetria = random(40, 80);        // 40% a 79%
+    int freq_cardiaca = random(60, 120);   // 60 a 119 BPM
+
+
+    Serial.println("\n=================================");
+    Serial.print("Data/Hora: ");
+    Serial.println(dataHora);
+    Serial.print("Temperatura (sensor): ");
+    Serial.print(temperatura, 3);
+    Serial.println(" °C");
+    Serial.print("Oximetria (simulada): ");
+    Serial.print(oximetria);
+    Serial.println(" %");
+    Serial.print("Freq. Cardíaca (simulada): ");
+    Serial.print(freq_cardiaca);
+    Serial.println(" BPM");
+    Serial.println("=================================");
+
+ 
+    if (!Firebase.ready()) {
+      Serial.println("Firebase não está pronto! Tentando reconectar...");
+      Firebase.reconnectWiFi(true);
+      delay(1000);
+      return;
+    }
+
+
+    if (Firebase.RTDB.setFloat(&fbdo, "/sensores_atuais/temperatura", temperatura)) {
+      Serial.println("✓ Temperatura enviada");
+    } else {
+      Serial.print("✗ Erro temperatura: ");
+      Serial.println(fbdo.errorReason().c_str());
+    }
+
+    if (Firebase.RTDB.setInt(&fbdo, "/sensores_atuais/oximetria", oximetria)) {
+      Serial.println("✓ Oximetria enviada");
+    } else {
+      Serial.print("✗ Erro oximetria: ");
+      Serial.println(fbdo.errorReason().c_str());
+    }
+
+    if (Firebase.RTDB.setInt(&fbdo, "/sensores_atuais/freq_cardiaca", freq_cardiaca)) {
+      Serial.println("✓ Frequência cardíaca enviada");
+    } else {
+      Serial.print("✗ Erro freq cardíaca: ");
+      Serial.println(fbdo.errorReason().c_str());
+    }
+
+
+    String pathHistorico = "/sensores_historico/" + String(dataHora);
+
+    FirebaseJson json;
+    json.set("temperatura", temperatura);       // float
+    json.set("oximetria", oximetria);           // int
+    json.set("freq_cardiaca", freq_cardiaca);   // int
+    json.set("timestamp", dataHora);            // string
+
+    if (Firebase.RTDB.setJSON(&fbdo, pathHistorico.c_str(), &json)) {
+      Serial.println("✓ Histórico salvo com sucesso!");
+    } else {
+      Serial.print("✗ Erro histórico: ");
+      Serial.println(fbdo.errorReason().c_str());
+    }
+  }
+
+  delay(100);  
+}
