@@ -27,8 +27,8 @@ int spo2;
 float temperatura;
 
 // ================= WIFI & FIREBASE =================
-#define WIFI_SSID "Emerson"
-#define WIFI_PASSWORD "guebas123"
+#define WIFI_SSID "PET Colaboardores"
+#define WIFI_PASSWORD "petagregado"
 #define DATABASE_URL "projeto-integradora-ii-default-rtdb.firebaseio.com"
 #define DATABASE_SECRET "uC0SyV22Gi3CEPqkslCwpJtPB1Kr2EAiH9JmrMVD"
 
