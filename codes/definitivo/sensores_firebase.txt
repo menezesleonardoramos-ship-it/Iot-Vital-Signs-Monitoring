@@ -1,17 +1,16 @@
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
 #include "MAX30105.h"
 #include "heartRate.h"
 #include <WiFi.h>
 #include <Firebase_ESP_Client.h>
 #include <time.h>
 
-// ================= OLED =================
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// ================= OLED com U8g2 =================
+// Para OLED SSD1306 128x64 I2C (branco/azul)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+// Alternativa se a anterior não funcionar:
+// U8G2_SSD1306_128X64_ALT0_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 // ================= MAX30102 =================
 MAX30105 particleSensor;
@@ -109,16 +108,11 @@ void loop() {
 
 // ================= FUNÇÕES INICIALIZAÇÃO =================
 void initOLED() {
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("OLED falhou"));
-    for(;;);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
-  display.println("Sinais Vitais");
-  display.display();
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr); // Fonte padrão
+  u8g2.drawStr(0, 15, "Sinais Vitais");
+  u8g2.sendBuffer();
   delay(1000);
 }
 
@@ -177,28 +171,39 @@ void initFirebase() {
 
 // ================= FUNÇÕES PRINCIPAIS =================
 void updateDisplay() {
-  display.clearDisplay();
-  display.setCursor(0,0);
+  char buffer[20];
   
-  display.print("Temp: ");
-  display.print(temperatura, 1);
-  display.println(" C");
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr);
   
-  display.print("BPM: ");
+  // Temperatura
+  u8g2.setCursor(0, 12);
+  u8g2.print("Temp: ");
+  dtostrf(temperatura, 4, 1, buffer);
+  u8g2.print(buffer);
+  u8g2.print(" C");
+  
+  // BPM
+  u8g2.setCursor(0, 24);
+  u8g2.print("BPM: ");
   if (beatAvg > 0) {
-    display.println(beatAvg);
+    u8g2.print(beatAvg);
   } else {
-    display.println("--");
+    u8g2.print("--");
   }
   
-  display.print("SpO2: ");
-  display.print(spo2);
-  display.println(" %");
+  // SpO2
+  u8g2.setCursor(0, 36);
+  u8g2.print("SpO2: ");
+  u8g2.print(spo2);
+  u8g2.print(" %");
   
-  display.print("IR: ");
-  display.println(particleSensor.getIR());
+  // IR Value
+  u8g2.setCursor(0, 48);
+  u8g2.print("IR: ");
+  u8g2.print(particleSensor.getIR());
   
-  display.display();
+  u8g2.sendBuffer();
 }
 
 void sendToFirebase() {
