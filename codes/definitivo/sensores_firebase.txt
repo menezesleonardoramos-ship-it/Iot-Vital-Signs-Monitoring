@@ -32,7 +32,11 @@ int spo2 = 0;
 float temperatura = 0;
 
 // ================= WIFI & FIREBASE =================
+<<<<<<< HEAD
 #define WIFI_SSID "PET Convidados"
+=======
+#define WIFI_SSID "PET Colaboardores"
+>>>>>>> 02282985e6adffb91e45fa530261b7d70eb5a801
 #define WIFI_PASSWORD "petagregado"
 #define DATABASE_URL "projeto-integradora-ii-default-rtdb.firebaseio.com"
 #define DATABASE_SECRET "uC0SyV22Gi3CEPqkslCwpJtPB1Kr2EAiH9JmrMVD"
