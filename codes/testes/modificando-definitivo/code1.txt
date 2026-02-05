@@ -12,9 +12,9 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C displayOLED(U8G2_R0, U8X8_PIN_NONE);
 MAX30105 sensorMAX30102;
 
 // BPM 
-const byte RATE_SIZE = 6;  
+const byte bpm_media = 6;  
 int bpmAvg = 0;               // BPM médio final
-float bufferBPM[RATE_SIZE];   // Buffer de valores de BPM
+float bufferBPM[bpm_media];   // Buffer de valores de BPM
 byte indiceBPM = 0;           // Índice do buffer circular
 
 
@@ -143,11 +143,11 @@ void loop() {
       float bpm = 60000.0 / (now - tempoUltimoBatimento);
       if (bpm > 40 && bpm < 180) {
         bufferBPM[indiceBPM++] = bpm;
-        indiceBPM %= RATE_SIZE;
+        indiceBPM %= bpm_media;
 
         bpmAvg = 0;
-        for (byte i = 0; i < RATE_SIZE; i++) bpmAvg += bufferBPM[i];
-        bpmAvg /= RATE_SIZE;
+        for (byte i = 0; i < bpm_media; i++) bpmAvg += bufferBPM[i];
+        bpmAvg /= bpm_media;
       }
     }
     tempoUltimoBatimento = now;

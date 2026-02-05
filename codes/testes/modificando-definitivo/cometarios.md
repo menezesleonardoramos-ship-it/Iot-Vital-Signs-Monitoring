@@ -17,13 +17,11 @@
 ## INICIALIZAÇÃO DE DISPLAY E SENSORES
 
 ```cpp
-// Display OLED - Objeto para controlar display SSD1306 128x64 via I2C
-// U8G2_R0: Rotação normal (0 graus)
-// U8X8_PIN_NONE: Sem pino de reset dedicado
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+// Display OLED
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C displayOLED(U8G2_R0, U8X8_PIN_NONE);
 
-// Sensor MAX30102 - Para medição de BPM e SpO2
-MAX30105 particleSensor;
+// MAX30102 (BPM + SpO2)
+MAX30105 sensorMAX30102;
 ```
 
 
@@ -34,21 +32,21 @@ MAX30105 particleSensor;
 
 
 ```cpp
-const byte RATE_SIZE = 6;   // Tamanho do array para média móvel (6 valores)
-byte rates[RATE_SIZE];      // Array para armazenar valores de BPM
-byte rateIndex = 0;         // Índice atual no array
-int bpmAvg = 0;             // Média dos valores de BPM
+// BPM 
+const byte bpm_media = 6;  
+int bpmAvg = 0;               // BPM médio final
+float bufferBPM[bpm_media];   // Buffer de valores de BPM
+byte indiceBPM = 0;           // Índice do buffer circular
 
-// Variáveis para detecção de batimentos
-static long irAvg = 0;      // Média móvel do sinal IR
-static long irPrev = 0;     // Valor anterior do sinal IR
+// Variáveis auxiliares para detecção do batimento
+static long mediaIR = 0;   // Média móvel do sinal IR
+static long irAnterior = 0; // Valor anterior do sinal IR
 static bool rising = false; // Flag indicando se sinal está subindo
-static unsigned long lastBeatTime = 0; // Tempo do último batimento detectado
+static unsigned long tempoUltimoBatimento = 0; // Tempo do último batimento detectado
+
 ```
 
 
-
-### Explicação
 
 ---
 
@@ -65,7 +63,6 @@ int spo2 = 0;               // Valor médio de SpO2
 unsigned long lastSpO2Calc = 0; // Último tempo de cálculo do SpO2
 ```
 
-### Explicação
 
 ---
 
@@ -93,7 +90,7 @@ bool firebaseOnline = false;  // Flag indicando status da conexão Firebase
 bool sensoresProntos = false; // Flag indicando se sensores estão calibrados
 ```
 
-### Explicação
+
 
 ---
 
