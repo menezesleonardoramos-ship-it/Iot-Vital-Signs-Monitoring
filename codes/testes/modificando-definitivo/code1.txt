@@ -1,39 +1,41 @@
-#include <Wire.h>
-#include <U8g2lib.h>
-#include "MAX30105.h"
-#include <WiFi.h>
-#include <Firebase_ESP_Client.h>
-#include <time.h>
+#include <Wire.h>        // Biblioteca para comunicacao I2C
+#include <U8g2lib.h>     // Biblioteca para controle de displays displayOLED
+#include "MAX30105.h"    // Biblioteca para MAX30105.h 
+#include <WiFi.h>        // Biblioteca para conexao Wifi na ESP
+#include <Firebase_ESP_Client.h>  // Biblioteca para comunicacao com o Firebase
+#include <time.h> // Biblioteca para obter o tempo (usando timestamp)
 
-// ================= OLED =================
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+// Display OLED
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C displayOLED(U8G2_R0, U8X8_PIN_NONE);
 
-// ================= MAX30102 =================
-MAX30105 particleSensor;
+// MAX30102 (BPM + SpO2)
+MAX30105 sensorMAX30102;
 
-// ================= BPM =================
-const byte RATE_SIZE = 6;
-byte rates[RATE_SIZE];
-byte rateIndex = 0;
-int bpmAvg = 0;
+// BPM 
+const byte RATE_SIZE = 6;  
+int bpmAvg = 0;               // BPM médio final
+float bufferBPM[RATE_SIZE];   // Buffer de valores de BPM
+byte indiceBPM = 0;           // Índice do buffer circular
 
-static long irAvg = 0;
-static long irPrev = 0;
+
+// Variáveis auxiliares para detecção do batimento
+static long mediaIR = 0;
+static long irAnterior = 0;
 static bool rising = false;
-static unsigned long lastBeatTime = 0;
+static unsigned long tempoUltimoBatimento = 0;
 
-// ================= SpO2 =================
-#define SPO2_SIZE 3
+// SpO2 
+#define SPO2_SIZE 3        // Média móvel de SpO2
 int spo2Buffer[SPO2_SIZE];
 byte spo2Index = 0;
-int spo2 = 0;
-unsigned long lastSpO2Calc = 0;
+int spo2 = 0;              // Valor final de SpO2
+unsigned long ultimoCalculoSpO2 = 0;
 
-// ================= MAX30205 =================
-#define MAX30205_ADDRESS 0x48
-float temperatura = 36.5;
+// MAX30205 (Temperatura)
+#define MAX30205_ADDRESS 0x48 
+float temperatura = 36.5;       // Valor inicial estimado
 
-// ================= WIFI & FIREBASE =================
+// WIFI & FIREBASE 
 #define WIFI_SSID "PET Convidados"
 #define WIFI_PASSWORD "petagregado"
 #define DATABASE_URL "projeto-integradora-ii-default-rtdb.firebaseio.com"
@@ -43,57 +45,62 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-bool firebaseOnline = false;
-bool sensoresProntos = false;
+bool firebaseOnline = false;   // Status da conexão Firebase
+bool sensoresProntos = false;   // Indica quando os sensores estão estáveis
 
-// ================= LOADING =================
+// LOADING 
 bool telaInicial = true;
 unsigned long inicioSistema = 0;
 const unsigned long TEMPO_LOADING = 15000;
 
-// ================= TIMERS =================
-unsigned long lastFirebaseSend = 0;
-const unsigned long FIREBASE_INTERVAL = 5000;
+// TIMERS
+unsigned long ultimoEnvioFirebase = 0;
+const unsigned long INTERVALO_FIREBASE = 5000; // Envio a cada 5s
 
-// =============================================================
-// LOADING SCREEN
+
+// Exibe uma tela de loading enquanto os sensores estabilizam
 void loadingScreen() {
   unsigned long elapsed = millis() - inicioSistema;
   int progresso = map(elapsed, 0, TEMPO_LOADING, 0, 104);
   progresso = constrain(progresso, 0, 104);
 
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tr);
+  displayOLED.clearBuffer();
+  displayOLED.setFont(u8g2_font_6x10_tr);
 
-  u8g2.setCursor(14, 28);
-  u8g2.print("Carregando");
+  displayOLED.setCursor(14, 28);
+  displayOLED.print("Carregando");
 
-  u8g2.setCursor(14, 40);
-  u8g2.print("Sinais Vitais");
+  displayOLED.setCursor(14, 40);
+  displayOLED.print("Sinais Vitais");
 
-  u8g2.drawFrame(12, 54, 104, 6);
-  u8g2.drawBox(14, 56, progresso, 2);
+  displayOLED.drawFrame(12, 54, 104, 6);
+  displayOLED.drawBox(14, 56, progresso, 2);
 
-  u8g2.sendBuffer();
+  displayOLED.sendBuffer();
 }
 
-// =============================================================
+// SETUP 
 void setup() {
   Serial.begin(115200);
 
+  //Inicializa display
   Wire.begin(21, 22);
   Wire.setClock(100000);
 
-  u8g2.begin();
+  displayOLED.begin();
 
-  particleSensor.begin(Wire, I2C_SPEED_FAST);
-  particleSensor.setup(0x1F, 4, 2, 200, 215, 2048);
-  particleSensor.setPulseAmplitudeIR(0x0F);
-  particleSensor.setPulseAmplitudeRed(0x0F);
 
+  // Inicializa sensor MAX30102
+  sensorMAX30102.begin(Wire, I2C_SPEED_FAST);
+  sensorMAX30102.setup(0x1F, 4, 2, 200, 215, 2048);
+  sensorMAX30102.setPulseAmplitudeIR(0x0F);
+  sensorMAX30102.setPulseAmplitudeRed(0x0F);
+
+  // Conecta ao Wi-Fi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  config.database_url = DAT/ABASE_URL;
+  // Configura Firebase
+  config.database_url = DATABASE_URL;
   config.signer.tokens.legacy_token = DATABASE_SECRET;
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
@@ -103,10 +110,10 @@ void setup() {
   inicioSistema = millis();
 }
 
-// =============================================================
+
 void loop() {
 
-  // ===== LOADING 15s =====
+  // Caregamento 15s
   if (telaInicial) {
     loadingScreen();
     if (millis() - inicioSistema >= TEMPO_LOADING) {
@@ -116,36 +123,39 @@ void loop() {
     return;
   }
 
-  long irValue = particleSensor.getIR();
-  long redValue = particleSensor.getRed();
+  // Leitura dos sinais IR e RED
+  long irValue = sensorMAX30102.getIR();
+  long redValue = sensorMAX30102.getRed();
   unsigned long now = millis();
 
-  // ================= BPM =================
-  irAvg = irAvg * 0.95 + irValue * 0.05;
-  long signal = irValue - irAvg;
+  // BPM 
+  mediaIR = mediaIR * 0.95 + irValue * 0.05;
+  long signal = irValue - mediaIR;
 
-  if (signal > 1500 && irPrev < signal && !rising) rising = true;
-
-  if (rising && signal < irPrev) {
+  // Detecta subida do sinal (batimento)
+  if (signal > 1500 && irAnterior < signal && !rising) rising = true;
+  
+  // Detecta pico do batimento
+  if (rising && signal < irAnterior) {
     rising = false;
 
-    if (lastBeatTime > 0) {
-      float bpm = 60000.0 / (now - lastBeatTime);
+    if (tempoUltimoBatimento > 0) {
+      float bpm = 60000.0 / (now - tempoUltimoBatimento);
       if (bpm > 40 && bpm < 180) {
-        rates[rateIndex++] = bpm;
-        rateIndex %= RATE_SIZE;
+        bufferBPM[indiceBPM++] = bpm;
+        indiceBPM %= RATE_SIZE;
 
         bpmAvg = 0;
-        for (byte i = 0; i < RATE_SIZE; i++) bpmAvg += rates[i];
+        for (byte i = 0; i < RATE_SIZE; i++) bpmAvg += bufferBPM[i];
         bpmAvg /= RATE_SIZE;
       }
     }
-    lastBeatTime = now;
+    tempoUltimoBatimento = now;
   }
-  irPrev = signal;
+  irAnterior = signal;
 
-  // ================= SpO2 =================
-  if (millis() - lastSpO2Calc > 500) {
+  // SpO2 
+  if (millis() - ultimoCalculoSpO2 > 500) {
 
     static long irDC = 0;
     static long redDC = 0;
@@ -168,10 +178,10 @@ void loop() {
       spo2 = soma / SPO2_SIZE;
     }
 
-    lastSpO2Calc = millis();
+    ultimoCalculoSpO2 = millis();
   }
 
-  // ================= TEMPERATURA =================
+  // TEMPERATURA 
   static unsigned long lastTemp = 0;
   if (millis() - lastTemp > 2000) {
     float t = readMAX30205();
@@ -181,46 +191,46 @@ void loop() {
 
   updateDisplay();
 
-  // ================= FIREBASE =================
-  if (sensoresProntos && millis() - lastFirebaseSend > FIREBASE_INTERVAL) {
+  // FIREBASE 
+  if (sensoresProntos && millis() - ultimoEnvioFirebase > INTERVALO_FIREBASE) {
     sendToFirebase();
-    lastFirebaseSend = millis();
+    ultimoEnvioFirebase = millis();
   }
 }
 
-// =============================================================
+
 void updateDisplay() {
-  u8g2.clearBuffer();
+  displayOLED.clearBuffer();
 
-  u8g2.setFont(u8g2_font_5x8_tr);
-  u8g2.setCursor(12, 8);
-  u8g2.print("Sinais Vitais");
+  displayOLED.setFont(u8g2_font_5x8_tr);
+  displayOLED.setCursor(12, 8);
+  displayOLED.print("Sinais Vitais");
 
-  u8g2.setCursor(12, 16);
-  u8g2.print(firebaseOnline ? "Online" : "Offline");
+  displayOLED.setCursor(12, 16);
+  displayOLED.print(firebaseOnline ? "Online" : "Offline");
 
-  u8g2.drawLine(0, 18, 127, 18);
+  displayOLED.drawLine(0, 18, 127, 18);
 
-  u8g2.setFont(u8g2_font_6x10_tr);
+  displayOLED.setFont(u8g2_font_6x10_tr);
 
-  u8g2.setCursor(0, 32);
-  u8g2.print("BPM: ");
-  bpmAvg > 0 ? u8g2.print(bpmAvg) : u8g2.print("--");
+  displayOLED.setCursor(0, 32);
+  displayOLED.print("BPM: ");
+  bpmAvg > 0 ? displayOLED.print(bpmAvg) : displayOLED.print("--");
 
-  u8g2.setCursor(0, 44);
-  u8g2.print("SpO2: ");
-  spo2 > 0 ? u8g2.print(spo2) : u8g2.print("--");
-  u8g2.print(" %");
+  displayOLED.setCursor(0, 44);
+  displayOLED.print("SpO2: ");
+  spo2 > 0 ? displayOLED.print(spo2) : displayOLED.print("--");
+  displayOLED.print(" %");
 
-  u8g2.setCursor(0, 58);
-  u8g2.print("Temp: ");
-  u8g2.print(temperatura, 1);
-  u8g2.print(" C");
+  displayOLED.setCursor(0, 58);
+  displayOLED.print("Temp: ");
+  displayOLED.print(temperatura, 1);
+  displayOLED.print(" C");
 
-  u8g2.sendBuffer();
+  displayOLED.sendBuffer();
 }
 
-// =============================================================
+
 float readMAX30205() {
   Wire.beginTransmission(MAX30205_ADDRESS);
   Wire.write(0x00);
@@ -231,7 +241,7 @@ float readMAX30205() {
   return raw * 0.00390625;
 }
 
-// =============================================================
+
 String getTimestamp() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return "sem_tempo";
@@ -241,7 +251,7 @@ String getTimestamp() {
   return String(buffer);
 }
 
-// =============================================================
+
 void sendToFirebase() {
   if (!Firebase.ready()) {
     firebaseOnline = false;
@@ -250,12 +260,12 @@ void sendToFirebase() {
 
   bool ok = true;
 
-  // ===== ATUAIS =====
+  // Dados in real time (atuais)
   ok &= Firebase.RTDB.setFloat(&fbdo, "/atuais/temp", temperatura);
   ok &= Firebase.RTDB.setInt(&fbdo, "/atuais/bpm", bpmAvg);
   ok &= Firebase.RTDB.setInt(&fbdo, "/atuais/spo2", spo2);
 
-  // ===== HISTÓRICO =====
+  // HISTÓRICO 
   String timestamp = getTimestamp();
   String path = "/historico/" + timestamp;
 
